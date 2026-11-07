@@ -1,0 +1,139 @@
+name: Build DYO map
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the SVN revision is unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write   # keepalive: stop GitHub disabling the schedule after 60 days
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SVN_URL: https://www.cave-registry.org.uk/svn/DYOcatchment/DYO
+  THERION_VERSION: v6.4.1
+  DPI: '600'
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.rev.outputs.build }}
+      rev: ${{ steps.rev.outputs.rev }}
+    steps:
+      - name: Install svn
+        run: sudo apt-get -qq update && sudo apt-get install -y -qq subversion
+
+      - name: Compare SVN revision with deployed site
+        id: rev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          REV=$(svn info --non-interactive --show-item last-changed-revision "$SVN_URL")
+          PAGES_URL=$(gh api "repos/${{ github.repository }}/pages" --jq .html_url 2>/dev/null || true)
+          DEPLOYED=none
+          if [ -n "$PAGES_URL" ]; then
+            DEPLOYED=$(curl -fsS "${PAGES_URL%/}/revision.txt" 2>/dev/null | tr -d '[:space:]' || echo none)
+          fi
+          echo "SVN r$REV, deployed: $DEPLOYED, force: ${FORCE:-false}"
+          BUILD=false
+          if [ "$REV" != "$DEPLOYED" ] || [ "$FORCE" = "true" ]; then BUILD=true; fi
+          echo "rev=$REV" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: github.event_name == 'schedule'
+      - name: Keepalive
+        if: github.event_name == 'schedule'
+        uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1.2.1
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      REV: ${{ needs.check.outputs.rev }}
+      PROJ_NETWORK: 'ON'   # let PROJ fetch OSTN15 grids for osgb:SN if needed
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y -qq subversion libvips-tools \
+            texlive-binaries texlive-metapost \
+            cmake ninja-build g++ libproj-dev proj-data libshp-dev \
+            imagemagick libmagick++-dev libfmt-dev gettext
+
+      - name: Cache Therion
+        id: therion-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/therion
+          key: therion-${{ env.THERION_VERSION }}-ubuntu-24.04
+
+      - name: Build Therion
+        if: steps.therion-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 -b "$THERION_VERSION" https://github.com/therion/therion therion-src
+          cmake -S therion-src -B therion-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/therion" \
+            -DBUILD_LOCH=OFF -DBUILD_XTHERION=OFF -DBUILD_THBOOK=OFF \
+            -DUSE_BUNDLED_CATCH2=ON
+          cmake --build therion-build -t therion
+          cmake --install therion-build
+
+      - name: Add Therion to PATH
+        run: |
+          echo "$HOME/therion/bin" >> "$GITHUB_PATH"
+          "$HOME/therion/bin/therion" --version
+
+      - name: Export survey from SVN
+        run: svn export --non-interactive -q -r "$REV" "$SVN_URL" src
+
+      - name: Run Therion
+        working-directory: src
+        run: |
+          therion dyo-thconfig.thconfig
+          test -s map.pdf
+
+      - name: Upload Therion log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: therion-log-r${{ env.REV }}
+          path: src/therion.log
+          if-no-files-found: ignore
+
+      - name: Build deep-zoom viewer
+        run: |
+          REVISION="$REV" HTML_NAME=index.html ./make-mapviewer.sh src/map.pdf "$DPI" site
+          echo "$REV" > site/revision.txt
+          touch site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
